@@ -1,0 +1,507 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Xml;
+using HtmlAgilityPack;
+using Quartz;
+using SCC.Common;
+using SCC.Crawler.Tools;
+using SCC.Interface;
+using SCC.Models;
+
+namespace SCC.Crawler.GP
+{
+    /// <summary>
+    ///     河南快3
+    /// </summary>
+    [DisallowConcurrentExecution]
+    [PersistJobDataAfterExecution]
+    public class HeNanK3Job : IJob
+    {
+        /// <summary>
+        ///     构造函数
+        /// </summary>
+        public HeNanK3Job()
+        {
+            log = new LogHelper();
+            services = IOC.Resolve<IOpen3Code>();
+            email = IOC.Resolve<IEmail>();
+        }
+
+        /// <summary>
+        ///     作业执行入口
+        /// </summary>
+        /// <param name="context">作业执行上下文</param>
+        public void Execute(IJobExecutionContext context)
+        {
+            Config = CommonHelper.GetConfigFromDataMap(context.JobDetail.JobDataMap);
+            //预设节假日不开奖
+            if (Config.SkipDate.Contains(CommonHelper.SCCSysDateTime.ToString("yyyyMMdd"))) return;
+            LatestQiHao = context.JobDetail.JobDataMap.GetString("LatestQiHao");
+            try
+            {
+                //服务启动时配置初始数据
+                if (string.IsNullOrEmpty(LatestQiHao))
+                {
+                    var lastItem = services.GetLastItem(currentLottery);
+                    if (lastItem != null) LatestQiHao = lastItem.Term.ToString();
+                }
+
+                //第一次启动服务或最新期号为昨天的开奖期号，则自检昨天开奖数据是否抓取完毕(否则插入邮件数据)，并重置当天期号和失败列表
+                if (string.IsNullOrEmpty(LatestQiHao) ||
+                    !LatestQiHao.StartsWith(CommonHelper.SCCSysDateTime.ToString("yyMMdd")))
+                {
+                    CheckingYesterdayTheLotteryData();
+                    LatestQiHao = CommonHelper.GenerateTodayQiHaoYYMMDDQQQ(0);
+                }
+
+                //当最新期号不符合当天总期数，执行当天作业
+                if (Convert.ToInt32(LatestQiHao.Substring(6)) != Config.TimesPerDay)
+                {
+                    DoTodayJobByMainUrl();
+                    DoTodayJobByBackUrl();
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error(GetType(), string.Format("【{0}】抓取时发生错误，错误信息【{1}】", Config.Area + currentLottery, ex.Message));
+            }
+
+            //保存最新期号和失败期号列表
+            context.JobDetail.JobDataMap["LatestQiHao"] = LatestQiHao;
+        }
+
+        /// <summary>
+        ///     自检昨天开奖数据
+        /// </summary>
+        private void CheckingYesterdayTheLotteryData()
+        {
+            if (Config.SkipDate.Contains(CommonHelper.SCCSysDateTime.AddDays(-1).ToString("yyyyMMdd")))
+                return; //如果昨日设定不开奖则不自检昨日开奖数据
+            //从数据库中获取昨天数据抓取失败列表
+            FailedQiHaoList = services.GetYesterdayFailQQList(currentLottery, Config.TimesPerDay);
+            if (FailedQiHaoList.Count > 0)
+            {
+                DoYesterdayFailedListByMainUrl();
+                DoYesterdayFailedListByBackUrl();
+            }
+        }
+
+        /// <summary>
+        ///     从备用地址执行今天任务
+        /// </summary>
+        private void DoTodayJobByBackUrl()
+        {
+            if (!string.IsNullOrEmpty(Config.BackUrl))
+            {
+                var OpenList = GetDocByBackUrl();
+                if (OpenList.Count == 0) return; //无抓取数据
+                var newestQiHao = OpenList.Max(w => w.QiHao);
+                var startQiNum = Convert.ToInt32(LatestQiHao.Substring(6)) + 1;
+                var newestQiNum = Convert.ToInt32(newestQiHao.Substring(6));
+                if (startQiNum > newestQiNum) return; //无最新数据
+                var total = OpenList.Count;
+
+                var getQiHao = string.Empty;
+                for (var i = startQiNum; i <= newestQiNum; i++)
+                {
+                    getQiHao = CommonHelper.GenerateTodayQiHaoYYMMDDQQ(i);
+                    var matchItem = OpenList.Where(R => R.QiHao.ToString() == getQiHao).FirstOrDefault();
+                    var step = 0;
+                    var nowQiHao = Convert.ToInt32(startQiNum);
+                    while (matchItem == null)
+                        if (step <= total)
+                        {
+                            nowQiHao++;
+                            step++;
+                            matchItem = OpenList.Where(R => R.QiHao.ToString() == nowQiHao.ToString()).FirstOrDefault();
+                        }
+                        else
+                        {
+                            matchItem = null;
+                            break;
+                        }
+
+                    if (matchItem != null && SaveRecord(matchItem))
+                    {
+                        //处理成功写入日志
+                        log.Info(GetType(), CommonHelper.GetJobBackLogInfo(Config, getQiHao));
+                        LatestQiHao = getQiHao;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        ///     通过主站点抓取开奖数据
+        /// </summary>
+        private void DoTodayJobByMainUrl()
+        {
+            var OpenList = GetDocByMainUrl();
+            if (OpenList.Count == 0) return; //无抓取数据
+            var newestQiHao = OpenList.Max(W => W.QiHao);
+            var startQiNum = Convert.ToInt32(LatestQiHao.Substring(6)) + 1;
+            var newestQiNum = Convert.ToInt32(newestQiHao.Substring(6));
+            if (startQiNum > newestQiNum) return; //无最新数据
+            var total = OpenList.Count; //处理最新开奖数据
+            //处理最新开奖数据
+            var getQiHao = string.Empty;
+            for (var i = startQiNum; i <= newestQiNum; i++)
+            {
+                getQiHao = CommonHelper.GenerateTodayQiHaoYYMMDDQQ(i);
+                var matchItem = OpenList.Where(R => R.QiHao.ToString() == getQiHao).FirstOrDefault();
+                var step = 0;
+                var nowQiHao = Convert.ToInt32(startQiNum);
+                while (matchItem == null)
+                    if (step <= total)
+                    {
+                        nowQiHao++;
+                        step++;
+                        matchItem = OpenList.Where(R => R.QiHao.ToString() == nowQiHao.ToString()).FirstOrDefault();
+                    }
+                    else
+                    {
+                        matchItem = null;
+                        break;
+                    }
+
+                if (matchItem != null && SaveRecord(matchItem))
+                {
+                    //处理成功写入日志
+                    log.Info(GetType(), CommonHelper.GetJobMainLogInfo(Config, getQiHao));
+                    LatestQiHao = getQiHao;
+                }
+            }
+        }
+
+        /// <summary>
+        ///     从备用网址处理昨天失败的开彩
+        /// </summary>
+        public void DoYesterdayFailedListByBackUrl()
+        {
+            if (!string.IsNullOrEmpty(Config.BackUrl) && FailedQiHaoList.Count > 0)
+            {
+                var OpenList = GetDocByBackUrl(false);
+                if (OpenList.Count == 0) return; //无抓取数据
+                var total = OpenList.Count; //处理最新开奖数据
+                var SuccessList = new List<string>();
+                foreach (var failedQiHao in FailedQiHaoList)
+                {
+                    var matchItem = OpenList.Where(R => R.QiHao.ToString() == failedQiHao).FirstOrDefault();
+                    var step = 0;
+                    var nowQiHao = Convert.ToInt32(failedQiHao);
+                    while (matchItem == null)
+                        if (step <= total)
+                        {
+                            nowQiHao++;
+                            step++;
+                            matchItem = OpenList.Where(R => R.QiHao.ToString() == nowQiHao.ToString()).FirstOrDefault();
+                        }
+                        else
+                        {
+                            matchItem = null;
+                            break;
+                        }
+
+                    if (matchItem != null && SaveRecord(matchItem))
+                    {
+                        //处理成功写入日志
+                        log.Info(GetType(), CommonHelper.GetJobBackLogInfo(Config, failedQiHao));
+                        SuccessList.Add(failedQiHao);
+                    }
+                }
+
+                foreach (var successQiHao in SuccessList) FailedQiHaoList.Remove(successQiHao);
+            }
+        }
+
+        /// <summary>
+        ///     保存开奖信息到数据库中
+        /// </summary>
+        /// <param name="list"></param>
+        /// <summary>
+        ///     通过主站抓取错误期号列表中每一个期号
+        /// </summary>
+        private void DoYesterdayFailedListByMainUrl()
+        {
+            var OpenList = GetDocByMainUrl(false);
+            if (OpenList.Count == 0) return; //无抓取数据
+            var total = OpenList.Count; //处理最新开奖数据
+            var SuccessList = new List<string>();
+            foreach (var failedQiHao in FailedQiHaoList)
+            {
+                var matchItem = OpenList.Where(R => R.QiHao.ToString() == failedQiHao).FirstOrDefault();
+                var step = 0;
+                var nowQiHao = Convert.ToInt32(failedQiHao);
+                while (matchItem == null)
+                    if (step <= total)
+                    {
+                        nowQiHao++;
+                        step++;
+                        matchItem = OpenList.Where(R => R.QiHao.ToString() == nowQiHao.ToString()).FirstOrDefault();
+                    }
+                    else
+                    {
+                        matchItem = null;
+                        break;
+                    }
+
+                if (matchItem != null && SaveRecord(matchItem))
+
+                {
+                    //处理成功写入日志
+                    log.Info(GetType(), CommonHelper.GetJobMainLogInfo(Config, failedQiHao));
+                    SuccessList.Add(failedQiHao);
+                }
+            }
+
+            foreach (var successQiHao in SuccessList) FailedQiHaoList.Remove(successQiHao);
+        }
+
+        /// <summary>
+        ///     抓取站点开奖数据
+        /// </summary>
+        /// <param name="url">备用站点</param>
+        /// <returns></returns>
+        private List<HeNanK3Enitity> GetDocByBackUrl(bool IsToday = true)
+        {
+            var list = new List<HeNanK3Enitity>();
+            try
+            {
+                var day = DateTime.Now.ToString("yyyyMMdd");
+                if (!IsToday) day = DateTime.Now.AddDays(-1).ToString("yyyyMMdd");
+                var url = string.Format(Config.BackUrl, day);
+                //" http://kaijiang.500.com/static/info/kaijiang/xml/bjk3/20171124.xml?_A=YLQMBVJT1511764350898"; 
+                //string url = @"http://www.bwlc.net/bulletin/prevqck3.html?page=3";
+                var HtmlResource = NetHelper.GetUrlResponse(url);
+                if (string.IsNullOrWhiteSpace(HtmlResource)) return list;
+
+                var doc = new XmlDocument();
+                doc.LoadXml(HtmlResource);
+                var records = doc.SelectNodes("//row");
+                if (records == null) return list;
+
+                foreach (XmlNode xmlnode in records)
+                {
+                    if (xmlnode.Attributes["expect"] == null ||
+                        string.IsNullOrWhiteSpace(xmlnode.Attributes["expect"].Value) ||
+                        xmlnode.Attributes["opencode"] == null ||
+                        string.IsNullOrWhiteSpace(xmlnode.Attributes["opencode"].Value)) continue;
+                    var num = xmlnode.Attributes["expect"].Value;
+                    var opencode = xmlnode.Attributes["opencode"].Value;
+                    var opentime = xmlnode.Attributes["opentime"].Value;
+                    var tmp = new HeNanK3Enitity
+                    {
+                        QiHao = num.Substring(2),
+                        KaiJiangHao = opencode,
+                        OpenTime = DateTime.Parse(opentime)
+                    };
+                    list.Add(tmp);
+                }
+
+                var checkDataHelper = new CheckDataHelper();
+                var dbdata = services.GetListIn(currentLottery, IsToday)
+                    .ToDictionary(w => w.Term.ToString(), w => w.GetCodeStr());
+                checkDataHelper.CheckData(dbdata, list.ToDictionary(w => w.QiHao, w => w.KaiJiangHao), Config.Area,
+                    currentLottery);
+            }
+            catch (Exception ex)
+            {
+                log.Error(GetType(),
+                    string.Format("【{0}】通过主站点抓取开奖列表时发生错误，错误信息【{1}】", Config.Area + currentLottery, ex.Message));
+            }
+
+            return list;
+        }
+
+        /// 从主站抓取开奖数据 昨天/今天
+        /// </summary>
+        /// <param name="IsToday"></param>
+        /// <returns></returns>
+        private List<HeNanK3Enitity> GetDocByMainUrl(bool IsToday = true)
+        {
+            var list = new List<HeNanK3Enitity>();
+            try
+            {
+                var day = CommonHelper.SCCSysDateTime.ToString("yyyyMMdd");
+                if (!IsToday) day = CommonHelper.SCCSysDateTime.AddDays(-1).ToString("yyyyMMdd");
+                var url = string.Format(Config.MainUrl, day);
+                //@"http://www.henanfucai.com/Kuaikai/Kuai3Zoushi.html?selectDate=20171208";
+                var HtmlResource = NetHelper.GetUrlResponse(url);
+                if (HtmlResource == null) return list;
+
+
+                if (!string.IsNullOrWhiteSpace(HtmlResource))
+                {
+                    var doc = new HtmlDocument();
+                    doc.LoadHtml(HtmlResource);
+
+                    var data = doc.DocumentNode.SelectNodes("//*[@id=\"content\"]");
+                    if (data == null) return list;
+                    if (data != null)
+                    {
+                        foreach (var item in data[0].ChildNodes)
+                        {
+                            var qihao = "";
+                            var opencode = new List<string>();
+                            if (item.Name == "tr" && item.GetAttributeValue("class", "") == "xunhuan")
+                                foreach (var item2 in item.ChildNodes)
+                                {
+                                    if (item2.GetAttributeValue("class", "") == "td_1") qihao = item2.InnerText;
+                                    if (item2.GetAttributeValue("class", "") == "td_2")
+                                        opencode.Add(item2.InnerText.Trim());
+                                }
+
+                            if (opencode.Count == 3)
+                            {
+                                var num = qihao.Substring(2).Remove(6, 1);
+                                var tmp = new HeNanK3Enitity
+                                {
+                                    QiHao = num,
+                                    KaiJiangHao = string.Join(",", opencode),
+                                    OpenTime = GetOpenTimeByPeriodNum(int.Parse(num))
+                                };
+                                list.Add(tmp);
+                            }
+                        }
+
+                        var checkDataHelper = new CheckDataHelper();
+                        var dbdata = services.GetListIn(currentLottery, IsToday)
+                            .ToDictionary(w => w.Term.ToString(), w => w.GetCodeStr());
+                        checkDataHelper.CheckData(dbdata, list.ToDictionary(w => w.QiHao, w => w.KaiJiangHao),
+                            Config.Area, currentLottery);
+                    }
+                }
+            }
+            catch (Exception ee)
+            {
+                log.Error(GetType(),
+                    string.Format("【{0}】通过站点抓取开奖列表时发生错误，错误信息【{1}】", Config.Area + currentLottery, ee.Message));
+            }
+
+            return list;
+        }
+
+        /// <summary>
+        ///     根据期号得到开奖日期
+        /// </summary>
+        /// <param name="PeriodNum"></param>
+        /// <returns></returns>
+        public DateTime GetOpenTimeByPeriodNum(int PeriodNum)
+        {
+            if (PeriodNum < 10000000) return DateTime.Now;
+            var year = int.Parse(PeriodNum.ToString().Substring(0, 2));
+            var month = int.Parse(PeriodNum.ToString().Substring(2, 2));
+            var day = int.Parse(PeriodNum.ToString().Substring(4, 2));
+            var qi = int.Parse(PeriodNum.ToString().Substring(6, 2)) - 1;
+            var time = new DateTime(2000 + year, month, day, Config.StartHour, Config.StartMinute, 0);
+            time = time.AddMinutes(qi * Config.Interval);
+            return time;
+        }
+
+        /// <summary>
+        ///     将此彩种指定期号和开奖号码保存至数据库
+        /// </summary>
+        /// <param name="QiHao">期号</param>
+        /// <param name="OpenCode">开奖号码(形如01,02,03)</param>
+        /// <param name="IsYesterdayRecord">是否是保存昨天的记录</param>
+        /// <returns></returns>
+        private bool SaveRecord(HeNanK3Enitity data)
+        {
+            var model = new OpenCode3Model();
+            model.Term = Convert.ToInt64(data.QiHao); //期号
+            var haoMaArray = data.KaiJiangHao.Split(',');
+            model.OpenCode1 = Convert.ToInt32(haoMaArray[0]);
+            model.OpenCode2 = Convert.ToInt32(haoMaArray[1]);
+            model.OpenCode3 = Convert.ToInt32(haoMaArray[2]);
+
+            model.OpenTime = data.OpenTime;
+            if (services.AddOpen3Code(currentLottery, model))
+            {
+                GetMaxPeriodNum((int) model.Term); //添加成功存放期数
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        ///     比较期号大的存入LatestQiHao
+        /// </summary>
+        /// <param name="PeriodNum"></param>
+        public void GetMaxPeriodNum(int PeriodNum)
+        {
+            var lastqihao = 0;
+            int.TryParse(LatestQiHao, out lastqihao);
+
+            if (lastqihao < PeriodNum) LatestQiHao = PeriodNum.ToString();
+        }
+
+        /// <summary>
+        ///     获取今天期数
+        /// </summary>
+        /// <param name="time"></param>
+        /// <param name="IsToday"></param>
+        /// <returns></returns>
+        public string GetPeriodsNumberToDay(DateTime time, bool IsToday = false)
+        {
+            if (!IsToday) return Config.TimesPerDay.ToString();
+            int hc = 0, mc = 0;
+            if (time.Hour >= Config.StartHour) //
+            {
+                hc = (time.Hour - Config.StartHour) * 6; //已开期数小时部分
+                mc = time.Minute / 10; //已开期分钟部分
+                if (Config.StartMinute == 0) mc += 1;
+            }
+
+            return hc + mc >= 10 ? (hc + mc).ToString() : "0" + (hc + mc); //;
+        }
+
+
+        #region Attribute
+
+        /// <summary>
+        ///     配置信息
+        /// </summary>
+        private SCCConfig Config;
+
+        /// <summary>
+        ///     当天抓取的最新一期期号
+        /// </summary>
+        private string LatestQiHao = "0";
+
+        /// <summary>
+        ///     当天抓取失败列表
+        /// </summary>
+        private List<string> FailedQiHaoList;
+
+        /// <summary>
+        ///     日志对象
+        /// </summary>
+        private readonly LogHelper log;
+
+        /// <summary>
+        ///     数据服务
+        /// </summary>
+        private readonly IOpen3Code services;
+
+        /// <summary>
+        ///     当前彩种
+        /// </summary>
+        private SCCLottery currentLottery => SCCLottery.HeNanK3;
+
+        /// <summary>
+        ///     邮件接口
+        /// </summary>
+        private IEmail email;
+
+        #endregion
+    }
+
+    public class HeNanK3Enitity
+    {
+        public string QiHao { get; set; }
+        public string KaiJiangHao { get; set; }
+        public DateTime OpenTime { get; set; }
+    }
+}
